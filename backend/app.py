@@ -1,12 +1,10 @@
 import os, tempfile
 import gradio as gr
-from dotenv import load_dotenv
+import edge_tts
 from faster_whisper import WhisperModel
-from openai import OpenAI
 
-load_dotenv()
 whisper = WhisperModel("base", device="cpu", compute_type="int8")
-client = OpenAI()
+VOICE = "en-US-AriaNeural"
 
 
 def transcribe(path):
@@ -16,13 +14,11 @@ def transcribe(path):
     return " ".join(s.text.strip() for s in segments)
 
 
-def speak(text):
+async def speak(text):
     if not text.strip():
         return None
     out = os.path.join(tempfile.gettempdir(), "voxbridge_out.mp3")
-    res = client.audio.speech.create(model="gpt-4o-mini-tts", voice="alloy", input=text)
-    with open(out, "wb") as f:
-        f.write(res.read())
+    await edge_tts.Communicate(text, VOICE).save(out)
     return out
 
 
