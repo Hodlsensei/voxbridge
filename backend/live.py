@@ -11,12 +11,19 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
 SR = 16000                 # mic sample rate for Whisper
 BLOCK = int(SR * 0.03)     # 30 ms blocks
+CALIB_BLOCKS = 60          # ~1.8s of room-noise measurement at startup
 SILENCE_END = 0.5          # seconds of silence that ends a sentence
 MIN_SPEECH = 0.3           # ignore blips shorter than this
 MAX_UTT = 15               # force-flush long speech (seconds)
 VOICE = "en-US-AriaNeural"
 VOICE_RATE = "+10%"        # faster playback = less lag for the caller
-HALLUCINATIONS = {"music", "you", "please", "thank you", "thanks for watching", "bye"}
+GROQ_MODEL = "whisper-large-v3"   # or "whisper-large-v3-turbo" (a bit faster)
+
+# Whisper invents these when it only hears noise
+HALLUCINATIONS = {"music", "you", "thanks for watching"}
+# One-word replies that are real speech on a call
+KEEP_SHORT = {"hello", "hi", "hey", "yes", "no", "okay", "ok", "bye", "thanks",
+              "please", "sorry", "sure", "right", "yeah", "wow", "alright"}
 
 _local = None
 
@@ -27,6 +34,19 @@ def local_model():
         print("Loading local Whisper (base.en)...")
         _local = WhisperModel("base.en", device="cpu", compute_type="int8", cpu_threads=4)
     return _local
+
+
+def worth_speaking(text):
+    """Skip noises, laughter, filler and stray fragments."""
+    t = text.lower().strip(" .!?,")
+    if not t or t in HALLUCINATIONS:
+        return False
+    words = t.replace(",", " ").split()
+    if len(words) == 1 and t not in KEEP_SHORT:
+        return False
+    if len(words) > 3 and len(set(words)) == 1:  # "ha ha ha ha"
+        return False
+    return True
 
 
 def normalize(audio):
@@ -49,7 +69,10 @@ def to_wav_bytes(audio):
 
 
 def find_device(name_part, kind):
+    hostapis = sd.query_hostapis()
     for i, d in enumerate(sd.query_devices()):
+        if "WDM-KS" in hostapis[d["hostapi"]]["name"]:
+            continue  # WDM-KS devices often fail to open
         ch = d["max_output_channels"] if kind == "output" else d["max_input_channels"]
         if ch > 0 and name_part.lower() in d["name"].lower():
             return i
@@ -92,9 +115,11 @@ def main():
     key = os.getenv("GROQ_API_KEY")
     if key and not args.local:
         from groq import Groq
-        groq_client = Groq(api_key=key)
-        print("Transcription: Groq whisper-large-v3-turbo")
+        groq_client = Groq(api_key=key, timeout=8.0, max_retries=0)
+        print(f"Transcription: Groq {GROQ_MODEL}")
     else:
+        if not key:
+            print("No GROQ_API_KEY found in backend/.env")
         local_model()
         print("Transcription: local Whisper base.en")
 
@@ -104,13 +129,15 @@ def main():
             try:
                 r = groq_client.audio.transcriptions.create(
                     file=("speech.wav", to_wav_bytes(audio)),
-                    model="whisper-large-v3-turbo",
+                    model=GROQ_MODEL,
                     language="en",
                     temperature=0.0,
                 )
+                print("  [groq]")
                 return r.text.strip()
             except Exception as e:
                 print("Groq failed, using local model:", repr(e))
+        print("  [local]")
         segs, _ = local_model().transcribe(
             audio, language="en", beam_size=1,
             vad_filter=True, condition_on_previous_text=False,
@@ -128,7 +155,8 @@ def main():
                 t0 = time.time()
                 text = transcribe(audio)
                 t_stt = time.time() - t0
-                if not text or text.lower().strip(" .!?") in HALLUCINATIONS:
+                if not worth_speaking(text):
+                    print(f"  (skipped: {text!r})")
                     continue
                 print("You said:", text)
 
@@ -153,7 +181,7 @@ def main():
     threading.Thread(target=worker, daemon=True).start()
 
     state = {"calib": 0, "noise": 0.0, "thr": 0.015, "buf": [], "speech": 0, "last": 0.0}
-    preroll = deque(maxlen=7)
+    preroll = deque(maxlen=10)  # ~0.3s kept before speech starts
 
     def callback(indata, frames, t, status):
         if speaking.is_set():
@@ -163,11 +191,11 @@ def main():
         rms = float(np.sqrt(np.mean(chunk ** 2)))
         s = state
 
-        if s["calib"] < 30:  # first ~1s: measure room noise
+        if s["calib"] < CALIB_BLOCKS:  # measure room noise
             s["noise"] += rms
             s["calib"] += 1
-            if s["calib"] == 30:
-                s["thr"] = min(0.04, max(0.015, s["noise"] / 30 * 3))
+            if s["calib"] == CALIB_BLOCKS:
+                s["thr"] = min(0.04, max(0.015, s["noise"] / CALIB_BLOCKS * 3))
                 print(f"Ready. Speak in short sentences and pause (threshold {s['thr']:.4f}).")
             return
 
